@@ -1,7 +1,4 @@
 (defpackage #:logic-backend-datalog/tests
-  (:use #:cl #:rove))
+  (:use #:cl #:rove #:logic-protocol #:logic-backend-datalog))
 
 (in-package #:logic-backend-datalog/tests)
-
-(deftest package-exists
-  (ok (find-package :logic-backend-datalog)))
