@@ -2,7 +2,8 @@
 
 ;;; The default logic-protocol backend: pure Lisp, no dependencies.
 ;;;
-;;; Normative for L0 (the brief's locked decisions plus this contract):
+;;; Normative for L0 (the brief's locked decisions plus this contract), and
+;;; PERFORMANCE for 0.2.0 (issues #4 and #5):
 ;;;
 ;;; - EVALUATION. Bottom-up, stratum by stratum in the order of
 ;;;   LOGIC-PROTOCOL:STRATIFY over the program's :NORMAL rules. Within a
@@ -11,8 +12,9 @@
 ;;;   evaluation (positive atoms first as they bind variables, = as soon as one
 ;;;   side is bound, negations and other built-ins as soon as all their
 ;;;   variables are bound); the semantics never depend on the written order.
-;;;   Facts are indexed by relation (and, as the implementer sees fit, by
-;;;   bound argument positions), so a ground lookup does not scan the relation.
+;;;   Facts are indexed by relation and by every argument position (I2), so a
+;;;   ground lookup does not scan the relation. PERFORMANCE says how the
+;;;   default evaluator orders a body and runs a stratum.
 ;;;
 ;;; - INCREMENTAL MAINTENANCE. Additions: semi-naive from the added facts
 ;;;   (the new base facts, or for ADD-RULES the new rules' first derivations).
@@ -37,7 +39,85 @@
 ;;;   tests/incremental-cost-test.lisp). An UPDATE that touches K facts of the
 ;;;   model charges O(K × body matches per fact), not O(|model|): one input
 ;;;   field in an L3 form, or one request asserted in L1, costs about what it
-;;;   changes.
+;;;   changes. Since 0.2.0 a bulk change also costs what it changes: loading
+;;;   facts into a program that already has its rules costs about what adding
+;;;   the rules to the loaded facts costs, and retracting a batch about what
+;;;   asserting it costs (tests/perf-test.lisp).
+;;;
+;;; - PERFORMANCE (0.2.0). Two evaluators behind the internal switch
+;;;   *STRATEGY*: :AUTO, the default, and :REFERENCE, the 0.1.0 evaluator
+;;;   kept unchanged as the oracle (alist bindings, %PICK at every search
+;;;   step, one %SOLVE-FROM per changed fact and literal, EXPLAIN heights by
+;;;   re-solving every rule at every height). Both give the same model, every
+;;;   delta, every proof and every why-not trace, on any program and any
+;;;   sequence of calls (tests/equivalence-test.lisp, random stratified
+;;;   programs and random batches). Both charge per BUDGET; the counts may
+;;;   differ, since :AUTO finds fewer duplicate derivations. Both write
+;;;   through the logged mutators (I3). Under :AUTO:
+;;;
+;;;   P1 COMPILED RULES (#5). Each rule is compiled once, on first use:
+;;;      variables numbered, bindings in a SIMPLE-VECTOR indexed by variable
+;;;      number (NIL is unbound: it is never a constant), every literal's
+;;;      arguments as constants or variable numbers. Evaluation follows a
+;;;      plan (P2) that fixes where each variable is bound, so a step knows
+;;;      which argument positions are bound and picks its index bucket
+;;;      directly; there is no ASSOC, no undo (a later step overwrites its
+;;;      own slots) and no choice of the next literal at run time.
+;;;
+;;;   P2 JOIN ORDER. A plan takes built-ins and negations as soon as their
+;;;      variables are bound and = as soon as one side is; then the atom
+;;;      with the fewest expected candidates: a ground lookup first, then an
+;;;      atom sharing a bound variable, then the rest, each group by the size
+;;;      of what the atom reads (its relation in the view, a delta, the index
+;;;      bucket of a constant argument), written order last. So no body
+;;;      starts from a large table with no argument bound while a smaller
+;;;      atom is available, and a delta is joined where it is cheapest. Plans
+;;;      that run once per call (full solves, set-at-a-time rounds, queries,
+;;;      ticks, EXPLAIN levels) use the sizes of that moment; the per-fact
+;;;      seed plans are static.
+;;;
+;;;   P3 SET-AT-A-TIME MAINTENANCE (#4). The over-delete and the insert phase
+;;;      of a stratum S (see "Maintenance" below) each choose a mode from
+;;;      their input delta D: per relation R, the facts the phase starts
+;;;      from. Over-delete: S's retracted base facts, the net removals of the
+;;;      lower relations S's rules read positively, the net additions of
+;;;      those they read under NOT. Insert: S's asserted and re-derived facts,
+;;;      the new rules' first derivations, the net additions of lower
+;;;      relations read positively, the net removals of those under NOT.
+;;;      SET-AT-A-TIME when for some R, |D_R| >= *SET-AT-A-TIME-MINIMUM*
+;;;      (default 256) or |D_R| >= *SET-AT-A-TIME-RATIO* (default 1/4) × |R|,
+;;;      |R| being R's facts in the model as the phase decides, plus those of
+;;;      D_R that are not in it; a NIL threshold does not apply. Otherwise
+;;;      PER-FACT: the 0.1.0 worklist (one seed per fact and literal) on
+;;;      compiled rules. *MODE-HOOK*, when set, hears (S PHASE MODE) for each
+;;;      phase with a non-empty D. Set-at-a-time runs semi-naive rounds:
+;;;      round 0 joins each delta, indexed like a relation, once per body
+;;;      literal that reads it; round k+1 joins what round k produced, which
+;;;      enters the model when round k ends. In insert rounds a derivation
+;;;      is found once per round, not once per new premise: for a delta at
+;;;      literal i, the earlier literals that read a delta of the same round
+;;;      read the model without it (so a bulk load joins each derivation once,
+;;;      as a full solve does). Re-derive stays per fact: it is an existence
+;;;      check with the head bound.
+;;;
+;;;   P4 OLD VIEW. :OLD reads the call's net removals through an index like
+;;;      the model's, so an over-delete lookup costs what a :NEW lookup costs
+;;;      (0.1.0 appends every removed fact of the relation to each lookup,
+;;;      which makes a bulk retraction under a higher stratum quadratic).
+;;;
+;;;   P5 EXPLAIN HEIGHTS. Least heights are computed only for the positive
+;;;      cone of the explained fact's relation (the relations its rules read
+;;;      through positive atoms, transitively; negations read the model) and
+;;;      kept, with the cone they cover, until the next write. Level k is
+;;;      semi-naive: for each positive literal, the facts of height exactly
+;;;      k-1 there, the earlier literals reading height <= k-2 and the later
+;;;      ones <= k-1. Proofs and why-not traces are then chosen as before.
+;;;
+;;;   The benchmarks are soft tests with ratio bounds several times looser
+;;;   than the speedups measured on the throwaway reference implementation
+;;;   (see the PR): 5k facts × 20 rules; a three-relation join starting at a
+;;;   large unbound table; EXPLAIN of a height-4 fact; 40 rules of 20
+;;;   variables and 8 atoms over 5k facts; a bulk retraction.
 ;;;
 ;;; - BUDGET. Call LOGIC-PROTOCOL:CHARGE-BUDGET once per derivation (a rule
 ;;;   body match that produces a head fact, new or not), once per fact
@@ -58,7 +138,7 @@
 ;;; - EXPLAIN. Proofs and why-not traces exactly as logic-protocol's
 ;;;   model.lisp defines them (least height, rule order, premise order). The
 ;;;   backend may compute heights on demand from the model; it need not store
-;;;   derivations.
+;;;   derivations. Under :AUTO, P5.
 ;;;
 ;;; - FEATURES. :STRATIFIED-NEGATION :TIME-STEP :INCREMENTAL. Not :CHOICE,
 ;;;   :CONSTRAINT or :UNSTRATIFIED-NEGATION (those are logic-backend-asp, L5);
@@ -85,6 +165,41 @@ negation and Dedalus time steps."))
   '(:stratified-negation :time-step :incremental))
 
 ;;; ------------------------------------------------------------------
+;;; The evaluator switch and the set-at-a-time thresholds (PERFORMANCE).
+;;; Internal, not exported: tests/equivalence-test.lisp and
+;;; tests/perf-test.lisp bind them.
+;;;
+;;; CONTRACT: *STRATEGY* ships as :REFERENCE until the :AUTO stubs at the end
+;;; of this file are implemented; the implementation makes :AUTO the default
+;;; (test DEFAULT-STRATEGY-IS-AUTO).
+
+(defvar *strategy* :reference
+  "The evaluator the backend GFs run: :AUTO (the 0.2.0 evaluator, the
+default once it is implemented) or :REFERENCE (the 0.1.0 evaluator, kept
+unchanged as the equivalence oracle). Read on every backend GF call; one
+state works under either.")
+
+(defvar *set-at-a-time-ratio* 1/4
+  "Under :AUTO, a maintenance phase runs set-at-a-time when, for some
+relation R, its input delta D_R has |D_R| >= this * |R| (see the header).
+NIL turns the ratio test off; 0 makes every non-empty phase set-at-a-time.")
+
+(defvar *set-at-a-time-minimum* 256
+  "Under :AUTO, a maintenance phase also runs set-at-a-time when some input
+delta D_R has at least this many facts. NIL turns the absolute test off.")
+
+(defvar *mode-hook* nil
+  "NIL, or a function the :AUTO maintenance calls as (STRATUM PHASE MODE) once
+for every stratum phase whose input delta is not empty: PHASE :OVER-DELETE or
+:INSERT, MODE :PER-FACT or :SET-AT-A-TIME. For tests.")
+
+(defun %auto-p ()
+  "Is the :AUTO evaluator selected? A *STRATEGY* other than :AUTO or
+:REFERENCE signals a TYPE-ERROR (with STORE-VALUE)."
+  (check-type *strategy* (member :auto :reference))
+  (eq *strategy* :auto))
+
+;;; ------------------------------------------------------------------
 ;;; State
 ;;;
 ;;; Invariants:
@@ -101,7 +216,8 @@ negation and Dedalus time steps."))
   (index (make-hash-table :test 'equal)))  ; (POSITION . VALUE) -> fact set
 
 (defstruct (crule (:constructor %make-crule (rule kind head body)))
-  rule kind head body)
+  rule kind head body
+  (compiled nil))                       ; :AUTO only: %CRULE-COMPILED fills it once
 
 (defstruct (dstate (:constructor make-dstate ()))
   (rels (make-hash-table :test 'eq))       ; relation -> RTAB (the model)
@@ -463,18 +579,23 @@ negation stays in the body, so it is still checked in VIEW."
 ;;; Charges: one per derivation (each body match, new head or not), one per
 ;;; over-deleted fact, one per re-derived fact, one per asserted base fact
 ;;; that enters the model.
+;;;
+;;; This is %MAINTAIN-STRATUM, the :REFERENCE path. Under :AUTO the same
+;;; phases run in %MAINTAIN-STRATUM-AUTO, phases 1 and 3 per fact or
+;;; set-at-a-time (PERFORMANCE, P3).
 
 (defun %maintain (st retracted asserted new-crules meter)
   "Bring the model up to date after the base change RETRACTED / ASSERTED
 (already applied to BASE) and the addition of NEW-CRULES. Returns the DELTA."
   (let ((*change* (make-hash-table :test 'eq))
-        (n (length (dstate-strata st))))
+        (n (length (dstate-strata st)))
+        (maintain-stratum (if (%auto-p) #'%maintain-stratum-auto #'%maintain-stratum)))
     (dotimes (s n)
       (flet ((here (facts) (remove-if-not (lambda (f) (= (%stratum st (car f)) s)) facts)))
-        (%maintain-stratum st s (here retracted) (here asserted)
-                           (remove-if-not (lambda (cr) (member cr (aref (dstate-strata st) s)))
-                                          new-crules)
-                           meter)))
+        (funcall maintain-stratum st s (here retracted) (here asserted)
+                 (remove-if-not (lambda (cr) (member cr (aref (dstate-strata st) s)))
+                                new-crules)
+                 meter)))
     (let ((added '()) (removed '()))
       (maphash (lambda (rel table)
                  (declare (ignore rel))
@@ -593,12 +714,14 @@ negation stays in the body, so it is still checked in VIEW."
 
 (defmethod backend-tick ((backend datalog-backend) state meter)
   (with-transaction (state)
-    (let ((next (make-hash-table :test 'equal)))
-      (dolist (cr (dstate-next state))
-        (%solve state (crule-body cr) '() :new
-                (lambda (env)
-                  (charge-budget meter)
-                  (setf (gethash (%head cr env) next) t))))
+    (let ((next (if (%auto-p)
+                    (%next-base-auto state meter)
+                    (let ((next (make-hash-table :test 'equal)))
+                      (dolist (cr (dstate-next state) next)
+                        (%solve state (crule-body cr) '() :new
+                                (lambda (env)
+                                  (charge-budget meter)
+                                  (setf (gethash (%head cr env) next) t))))))))
       (let ((retracted (loop for f being the hash-keys of (dstate-base state)
                              unless (gethash f next) collect f))
             (asserted (loop for f being the hash-keys of next
@@ -608,14 +731,16 @@ negation stays in the body, so it is still checked in VIEW."
         (%maintain state retracted asserted '() meter)))))
 
 (defmethod backend-query ((backend datalog-backend) state pattern meter)
-  (let ((answers '())
-        (variables (atom-variables pattern)))
-    (setf (budget-meter-partial-function meter) (lambda () answers))
-    (%solve state pattern '() :new
-            (lambda (env)
-              (push (mapcar (lambda (v) (cons v (cdr (assoc v env)))) variables) answers)
-              (charge-budget meter)))
-    answers))
+  (if (%auto-p)
+      (%query-auto state pattern meter)
+      (let ((answers '())
+            (variables (atom-variables pattern)))
+        (setf (budget-meter-partial-function meter) (lambda () answers))
+        (%solve state pattern '() :new
+                (lambda (env)
+                  (push (mapcar (lambda (v) (cons v (cdr (assoc v env)))) variables) answers)
+                  (charge-budget meter)))
+        answers)))
 
 (defmethod backend-facts ((backend datalog-backend) state relation)
   (flet ((facts-of (tab) (loop for f being the hash-keys of (rtab-all tab) collect f)))
@@ -743,9 +868,93 @@ negation stays in the body, so it is still checked in VIEW."
 
 (defmethod backend-explain ((backend datalog-backend) state fact)
   (if (in-model-p state fact)
-      (let ((*heights* (%heights state)))
+      (let ((*heights* (if (%auto-p) (%heights-auto state fact) (%heights state))))
         (%prove state fact (make-hash-table :test 'equal)))
       (%why-not state fact)))
+
+;;; ------------------------------------------------------------------
+;;; The 0.2.0 evaluator (:AUTO). Contract stubs. The four entry points the
+;;; GFs call under :AUTO are %MAINTAIN-STRATUM-AUTO, %QUERY-AUTO,
+;;; %NEXT-BASE-AUTO and %HEIGHTS-AUTO; %COMPILE-CRULE, %PLAN and
+;;; %SET-AT-A-TIME-P are the intended building blocks (their signatures may
+;;; change; tests/ only reach *STRATEGY*, the thresholds and *MODE-HOOK*).
+;;; The :REFERENCE code above stays as it is.
+
+(define-condition perf-pending (error)
+  ((what :initarg :what :reader perf-pending-what))
+  (:report (lambda (c s)
+             (format s "0.2.0 performance contract stub not implemented: ~S"
+                     (perf-pending-what c)))))
+
+(defun %perf-pending (what)
+  "Contract stub. Every call is replaced by the 0.2.0 implementation, then
+this function and PERF-PENDING are deleted."
+  (error 'perf-pending :what what))
+
+(defun %compile-crule (crule)
+  "CRULE compiled once (P1): its variables numbered in the order of
+(ATOM-VARIABLES (RULE-FORM RULE)), so an environment is a SIMPLE-VECTOR
+indexed by variable number and the proof bindings come out in order; each
+literal's arguments as constants or variable numbers; a static plan (%PLAN
+with no state) per body literal that can seed a derivation, for the rest of
+the body with that literal's variables bound, and one with the head's
+variables bound (re-derive)."
+  (declare (ignore crule))
+  (%perf-pending '%compile-crule))
+
+(defun %crule-compiled (crule)
+  "CRULE's compiled form, made on first use and kept on the CRULE."
+  (or (crule-compiled crule)
+      (setf (crule-compiled crule) (%compile-crule crule))))
+
+(defun %plan (st literals known sources)
+  "A join plan (P2) for the compiled LITERALS with the variables KNOWN
+bound: their evaluation order, for each atom the facts it reads (SOURCES
+maps an atom to its view or delta) and the argument positions bound when it
+is reached. With ST, atoms are ordered by the sizes at that time; with ST
+NIL the plan is static (bound positions, then written order)."
+  (declare (ignore st literals known sources))
+  (%perf-pending '%plan))
+
+(defun %set-at-a-time-p (st deltas)
+  "Is a maintenance phase whose input delta is DELTAS, a list of
+(RELATION . FACTS), run set-at-a-time (P3)? True when some FACTS has at
+least *SET-AT-A-TIME-MINIMUM* elements, or at least *SET-AT-A-TIME-RATIO*
+times the relation's size (its facts in the model of ST now, plus those of
+FACTS not in it). A NIL threshold does not apply."
+  (declare (ignore st deltas))
+  (%perf-pending '%set-at-a-time-p))
+
+(defun %maintain-stratum-auto (st s retracted asserted new meter)
+  "%MAINTAIN-STRATUM under :AUTO, with the same arguments, phases, charges
+and result (the model and *CHANGE* updated through the logged mutators and
+%NOTE): over-delete, re-derive, insert. Over-delete and insert each choose
+PER-FACT or SET-AT-A-TIME from their input delta (%SET-AT-A-TIME-P), tell
+*MODE-HOOK* (S PHASE MODE) when that delta is not empty, and run on compiled
+rules (P1, P2) with an indexed :OLD view (P4); re-derive is per fact."
+  (declare (ignore st s retracted asserted new meter))
+  (%perf-pending '%maintain-stratum-auto))
+
+(defun %query-auto (st pattern meter)
+  "BACKEND-QUERY under :AUTO: PATTERN compiled and planned once against the
+current sizes, the same answers, charges and partial function."
+  (declare (ignore st pattern meter))
+  (%perf-pending '%query-auto))
+
+(defun %next-base-auto (st meter)
+  "BACKEND-TICK's next base facts under :AUTO: an EQUAL hash table holding
+the head of every solution of every :NEXT rule's body in the current model,
+one charge per solution."
+  (declare (ignore st meter))
+  (%perf-pending '%next-base-auto))
+
+(defun %heights-auto (st fact)
+  "The least-height table %PROVE reads for FACT under :AUTO (P5): the same
+heights as %COMPUTE-HEIGHTS for every relation in the positive cone of
+FACT's relation, computed semi-naively level by level and cached in the
+state until the next write."
+  (declare (ignore st fact))
+  (%perf-pending '%heights-auto))
 
 (unless *logic-backend*
   (setf *logic-backend* (make-datalog-backend)))
