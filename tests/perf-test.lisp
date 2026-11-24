@@ -3,8 +3,9 @@
 ;;; Benchmarks (0.2.0) as soft tests. Each prints its times ("[bench]"
 ;;; lines) and asserts a generous ratio against the :REFERENCE evaluator or
 ;;; between two orders of the same work, never an absolute time, so a slow
-;;; machine or implementation does not fail them. The reference figures in
-;;; the PR were measured on SBCL; the bounds here are several times looser.
+;;; machine or implementation does not fail them. The bounds sit well under
+;;; the speedups a throwaway reference implementation measured on SBCL and
+;;; on ECL (see the PR); ECL's are the tighter ones.
 
 (defun bench-symbol (format-control &rest args)
   (intern (apply #'format nil format-control args) '#:logic-backend-datalog/tests))
@@ -63,8 +64,8 @@ negations (a second and a third stratum)."
         "the same model in either order and on either evaluator")
     (ok (<= rtf (+ (* 2 ftr) 0.01d0))
         "rules-then-facts costs at most twice facts-then-rules (set-at-a-time)")
-    (ok (at-least-times-faster-p ref-rtf rtf 3)
-        "rules-then-facts at least 3x faster than the per-fact reference")))
+    (ok (at-least-times-faster-p ref-rtf rtf 2.5d0)
+        "rules-then-facts at least 2.5x faster than the per-fact reference")))
 
 ;;; Join order: three relations, the first atom a large unbound table.
 
@@ -84,14 +85,16 @@ negations (a second and a third stratum)."
 (deftest bench-large-unbound-first-atom
   (let* ((facts (join-facts))
          (ref-p (with-strategy (:reference) (make-program :facts facts :budget :unlimited)))
-         (auto-ps (with-strategy (:auto)
-                    (loop repeat 3 collect (make-program :facts facts :budget :unlimited))))
+         (auto-p (with-strategy (:auto) (make-program :facts facts :budget :unlimited)))
          (reference (with-strategy (:reference) (seconds (lambda () (join-work ref-p)))))
          (auto (with-strategy (:auto)
-                 (loop for p in auto-ps minimize (seconds (lambda () (join-work p)))))))
+                 (+ (seconds (lambda () (add-rule auto-p *join-rule* :budget :unlimited)))
+                    (best-seconds 3 (lambda ()
+                                      (dotimes (i 10)
+                                        (query auto-p '(and (big ?x ?y) (mid ?y ?z) (small ?x))
+                                               :budget :unlimited))))))))
     (report "big x mid x small" "reference" reference "auto" auto)
-    (ok (equal (program-facts ref-p :relation 'hit)
-               (program-facts (first auto-ps) :relation 'hit)))
+    (ok (equal (program-facts ref-p :relation 'hit) (program-facts auto-p :relation 'hit)))
     (ok (= (length (program-facts ref-p :relation 'hit)) 100))
     (ok (at-least-times-faster-p reference auto 5)
         "the join starts from the small table, at least 5x faster")))
@@ -191,8 +194,8 @@ links, 4 shared attributes, 7 attributes of their own."
                rules))
     (ok (equal (program-facts ref-p) (program-facts (first auto-ps))))
     (ok (= (length (program-facts ref-p)) (+ 5250 (* 10 1050))) "ten chains of 1050 answers")
-    (ok (at-least-times-faster-p reference auto 3)
-        "compiled rules and vector environments, at least 3x faster")))
+    (ok (at-least-times-faster-p reference auto 2)
+        "compiled rules and vector environments, at least 2x faster")))
 
 ;;; Retracting a whole relation that a higher stratum joins (over-delete).
 

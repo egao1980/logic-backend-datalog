@@ -113,11 +113,18 @@
 ;;;      k-1 there, the earlier literals reading height <= k-2 and the later
 ;;;      ones <= k-1. Proofs and why-not traces are then chosen as before.
 ;;;
-;;;   The benchmarks are soft tests with ratio bounds several times looser
-;;;   than the speedups measured on the throwaway reference implementation
-;;;   (see the PR): 5k facts × 20 rules; a three-relation join starting at a
-;;;   large unbound table; EXPLAIN of a height-4 fact; 40 rules of 20
-;;;   variables and 8 atoms over 5k facts; a bulk retraction.
+;;;   P6 INDEX MEMORY (shared state, so under both evaluators). An index
+;;;      bucket, and any table made per delta or per round, starts with a
+;;;      few entries (MAKE-HASH-TABLE :SIZE) and grows. ECL's default hash
+;;;      table holds 1024 entries, so 0.1.0's one EQUAL table per
+;;;      (POSITION . VALUE) costs about 1 GB per 40k facts of distinct
+;;;      arguments there, and the benchmarks exhaust ECL's default 4 GB heap.
+;;;
+;;;   The benchmarks are soft tests with ratio bounds under the speedups a
+;;;   throwaway reference implementation measured on SBCL and on ECL (see
+;;;   the PR): 5k facts × 20 rules; a three-relation join starting at a large
+;;;   unbound table; EXPLAIN of a height-4 fact; 40 rules of 20 variables
+;;;   and 8 atoms over 5k facts; a bulk retraction.
 ;;;
 ;;; - BUDGET. Call LOGIC-PROTOCOL:CHARGE-BUDGET once per derivation (a rule
 ;;;   body match that produces a head fact, new or not), once per fact
@@ -878,7 +885,8 @@ negation stays in the body, so it is still checked in VIEW."
 ;;; %NEXT-BASE-AUTO and %HEIGHTS-AUTO; %COMPILE-CRULE, %PLAN and
 ;;; %SET-AT-A-TIME-P are the intended building blocks (their signatures may
 ;;; change; tests/ only reach *STRATEGY*, the thresholds and *MODE-HOOK*).
-;;; The :REFERENCE code above stays as it is.
+;;; The :REFERENCE evaluator above stays as it is; P6 changes only the
+;;; shared model index (%RAW-MODEL-ADD).
 
 (define-condition perf-pending (error)
   ((what :initarg :what :reader perf-pending-what))
