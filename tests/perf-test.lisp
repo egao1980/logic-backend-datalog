@@ -226,7 +226,7 @@ them again."
                   "reference retract" ref-retract "reference assert" ref-assert
                   "auto retract" retract "auto assert" assert)
           (ok (equal (program-facts ref-p) (program-facts auto-p)))
-          (ok (<= retract (+ (* 4 assert) 0.01d0))
+          (ok (<= retract (+ (* 4 assert) (max 0.01d0 (* 2 (clock-tick)))))
               "a bulk retraction costs about what the bulk assertion costs")
           (ok (at-least-times-faster-p ref-retract retract 5)
               "at least 5x faster than the reference over-delete"))))))

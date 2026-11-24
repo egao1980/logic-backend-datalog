@@ -78,6 +78,23 @@ LOGIC-BACKEND-DATALOG::*MODE-HOOK*. Returns the list."
     (funcall thunk)
     (/ (float (- (get-internal-run-time) start) 1d0) internal-time-units-per-second)))
 
+(defvar *clock-tick* nil
+  "Cached result of CLOCK-TICK.")
+
+(defun clock-tick ()
+  "Seconds between two distinct GET-INTERNAL-RUN-TIME readings, the smallest
+of three spins. Process CPU time advances in 1 ms or finer steps on most
+hosts and in 15.625 ms steps on Windows, so bounds on short timings need
+at least this much slack."
+  (or *clock-tick*
+      (setf *clock-tick*
+            (loop repeat 3
+                  minimize (let ((start (get-internal-run-time)))
+                             (loop for now = (get-internal-run-time)
+                                   until (/= now start)
+                                   finally (return (/ (float (- now start) 1d0)
+                                                      internal-time-units-per-second))))))))
+
 (defun best-seconds (runs thunk)
   (loop repeat runs minimize (seconds thunk)))
 
@@ -87,6 +104,8 @@ LOGIC-BACKEND-DATALOG::*MODE-HOOK*. Returns the list."
   (finish-output))
 
 (defun at-least-times-faster-p (slow fast factor)
-  "Is FAST at least FACTOR times faster than SLOW? Times under a
-millisecond count as one, so a timer tick cannot decide the outcome."
-  (>= (max slow 0.001d0) (* factor (max fast 0.001d0))))
+  "Is FAST at least FACTOR times faster than SLOW? Times under the larger of
+a millisecond and one CLOCK-TICK count as that, so a timer tick cannot
+decide the outcome."
+  (let ((floor (max 0.001d0 (clock-tick))))
+    (>= (max slow floor) (* factor (max fast floor)))))
