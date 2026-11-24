@@ -175,16 +175,12 @@ negation and Dedalus time steps."))
 ;;; The evaluator switch and the set-at-a-time thresholds (PERFORMANCE).
 ;;; Internal, not exported: tests/equivalence-test.lisp and
 ;;; tests/perf-test.lisp bind them.
-;;;
-;;; CONTRACT: *STRATEGY* ships as :REFERENCE until the :AUTO stubs at the end
-;;; of this file are implemented; the implementation makes :AUTO the default
-;;; (test DEFAULT-STRATEGY-IS-AUTO).
 
-(defvar *strategy* :reference
+(defvar *strategy* :auto
   "The evaluator the backend GFs run: :AUTO (the 0.2.0 evaluator, the
-default once it is implemented) or :REFERENCE (the 0.1.0 evaluator, kept
-unchanged as the equivalence oracle). Read on every backend GF call; one
-state works under either.")
+default) or :REFERENCE (the 0.1.0 evaluator, kept unchanged as the
+equivalence oracle). Read on every backend GF call; one state works under
+either.")
 
 (defvar *set-at-a-time-ratio* 1/4
   "Under :AUTO, a maintenance phase runs set-at-a-time when, for some
@@ -218,7 +214,14 @@ for every stratum phase whose input delta is not empty: PHASE :OVER-DELETE or
 ;;;     mutators, and BACKEND-ADD-RULES replaces (never mutates) the rule
 ;;;     slots, so a rollback replays the undo log and restores the slots.
 
-(defstruct (rtab (:constructor make-rtab ()))
+(defconstant +small-table-size+ 4
+  "The initial :SIZE of an index bucket and of every table made per delta,
+round or level (P6).")
+
+(defstruct (rtab (:constructor make-rtab ())
+                 (:constructor %make-small-rtab
+                     (&aux (all (make-hash-table :test 'equal :size +small-table-size+))
+                           (index (make-hash-table :test 'equal :size +small-table-size+)))))
   (all (make-hash-table :test 'equal))     ; fact -> T
   (index (make-hash-table :test 'equal)))  ; (POSITION . VALUE) -> fact set
 
@@ -237,7 +240,8 @@ for every stratum phase whose input delta is not empty: PHASE :OVER-DELETE or
   (readers (make-hash-table :test 'eq))    ; relation -> ((CRULE INDEX STRATUM) ...) positive atoms
   (neg-readers (make-hash-table :test 'eq)) ; relation -> ((CRULE INDEX STRATUM) ...) (not ATOM)
   (log :off)                               ; undo log during a transaction
-  (heights nil))                           ; EXPLAIN cache, dropped on every write
+  (heights nil)                            ; EXPLAIN cache, dropped on every write
+  (cone nil))                              ; :AUTO EXPLAIN cache (P5), (COVERED . HEIGHTS), dropped likewise
 
 (defun %stratum (st relation)
   (gethash relation (dstate-stratum-of st) 0))
@@ -249,17 +253,23 @@ for every stratum phase whose input delta is not empty: PHASE :OVER-DELETE or
 (defun base-p (st fact)
   (and (gethash fact (dstate-base st)) t))
 
+(defun %rtab-insert (tab fact)
+  "Add FACT to TAB's ALL table and to the bucket of each of its arguments.
+Buckets start small (P6)."
+  (setf (gethash fact (rtab-all tab)) t)
+  (loop for arg in (cdr fact)
+        for pos from 0
+        do (let ((key (cons pos arg)))
+             (setf (gethash fact (or (gethash key (rtab-index tab))
+                                     (setf (gethash key (rtab-index tab))
+                                           (make-hash-table :test 'equal
+                                                            :size +small-table-size+))))
+                   t))))
+
 (defun %raw-model-add (st fact)
-  (let ((tab (or (gethash (car fact) (dstate-rels st))
-                 (setf (gethash (car fact) (dstate-rels st)) (make-rtab)))))
-    (setf (gethash fact (rtab-all tab)) t)
-    (loop for arg in (cdr fact)
-          for pos from 0
-          do (let ((key (cons pos arg)))
-               (setf (gethash fact (or (gethash key (rtab-index tab))
-                                       (setf (gethash key (rtab-index tab))
-                                             (make-hash-table :test 'equal))))
-                     t)))))
+  (%rtab-insert (or (gethash (car fact) (dstate-rels st))
+                    (setf (gethash (car fact) (dstate-rels st)) (make-rtab)))
+                fact))
 
 (defun %raw-model-remove (st fact)
   (let ((tab (gethash (car fact) (dstate-rels st))))
@@ -278,7 +288,8 @@ for every stratum phase whose input delta is not empty: PHASE :OVER-DELETE or
   (let ((log (dstate-log st)))
     (unless (eq log :off)
       (setf (dstate-log st) (cons (cons op fact) log))))
-  (setf (dstate-heights st) nil))
+  (setf (dstate-heights st) nil
+        (dstate-cone st) nil))
 
 (defun model-add (st fact)
   "Add FACT to the model; T when it was not there."
@@ -338,7 +349,8 @@ for every stratum phase whose input delta is not empty: PHASE :OVER-DELETE or
              (%undo ,s entry))
            (%restore-rule-slots ,s ,saved))
          (setf (dstate-log ,s) :off
-               (dstate-heights ,s) nil)))))
+               (dstate-heights ,s) nil
+               (dstate-cone ,s) nil)))))
 
 (defun %not-p (lit)
   (and (consp lit) (symbolp (car lit)) (string= (symbol-name (car lit)) "NOT")))
@@ -880,24 +892,180 @@ negation stays in the body, so it is still checked in VIEW."
       (%why-not state fact)))
 
 ;;; ------------------------------------------------------------------
-;;; The 0.2.0 evaluator (:AUTO). Contract stubs. The four entry points the
+;;; The 0.2.0 evaluator (:AUTO, PERFORMANCE P1-P5). The four entry points the
 ;;; GFs call under :AUTO are %MAINTAIN-STRATUM-AUTO, %QUERY-AUTO,
-;;; %NEXT-BASE-AUTO and %HEIGHTS-AUTO; %COMPILE-CRULE, %PLAN and
-;;; %SET-AT-A-TIME-P are the intended building blocks (their signatures may
-;;; change; tests/ only reach *STRATEGY*, the thresholds and *MODE-HOOK*).
-;;; The :REFERENCE evaluator above stays as it is; P6 changes only the
-;;; shared model index (%RAW-MODEL-ADD).
+;;; %NEXT-BASE-AUTO and %HEIGHTS-AUTO. They read the shared state and write
+;;; it only through the logged mutators and %NOTE (I3), so transactions and
+;;; deltas work exactly as under :REFERENCE, and %PROVE / %WHY-NOT are
+;;; shared. The :REFERENCE evaluator above stays as it is; P6 changes only
+;;; the shared model index (%RTAB-INSERT).
+;;;
+;;; Two rules keep the executor simple and every iteration legal:
+;;; E1  No model write while a plan runs. A callback charges and records its
+;;;     result in a local table or list (OD, PENDING, the heads of one seed,
+;;;     answers, the next base facts, heights); the model writes, each with
+;;;     its %NOTE, happen between plan runs. So scans walk the model's own
+;;;     tables in place (CLHS 18.1.2.2), and CONTINUE from CHARGE-BUDGET
+;;;     resumes in a consistent state.
+;;; E2  Plans are data. Static plans depend only on their rule and are kept
+;;;     on the CRULE; sized plans live for one call. Nothing kept refers to
+;;;     the model, the strata or the readers, so a rollback or a new
+;;;     stratification leaves them valid.
 
-(define-condition perf-pending (error)
-  ((what :initarg :what :reader perf-pending-what))
-  (:report (lambda (c s)
-             (format s "0.2.0 performance contract stub not implemented: ~S"
-                     (perf-pending-what c)))))
+(defvar *old-removed* nil
+  "During one stratum's maintenance under :AUTO: relation -> RTAB of its net
+removals in this call, or :NONE (P4). Filled on the first :OLD read of the
+relation. Only lower relations are asked for (they are the only ones with a
+*CHANGE* table while the stratum's over-delete runs), and a lower relation's
+net change is final, so an entry never goes stale.")
 
-(defun %perf-pending (what)
-  "Contract stub. Every call is replaced by the 0.2.0 implementation, then
-this function and PERF-PENDING are deleted."
-  (error 'perf-pending :what what))
+(defun %old-removed-rtab (relation)
+  "RELATION's net removals in this call, indexed like a relation (P4), or NIL."
+  (let ((changes (and *change* (gethash relation *change*))))
+    (when changes
+      (let ((cached (and *old-removed* (gethash relation *old-removed*))))
+        (cond ((eq cached :none) nil)
+              (cached cached)
+              (t (let ((removed (loop for f being the hash-keys of changes using (hash-value s)
+                                      when (eq s :removed) collect f)))
+                   (let ((tab (and removed (%rtab-of removed))))
+                     (when *old-removed*
+                       (setf (gethash relation *old-removed*) (or tab :none)))
+                     tab))))))))
+
+(defun %rtab-of (facts)
+  "A fresh small RTAB holding FACTS (P6)."
+  (let ((tab (%make-small-rtab)))
+    (dolist (f facts tab)
+      (%rtab-insert tab f))))
+
+(defun %tab-count (tab)
+  (if tab (hash-table-count (rtab-all tab)) 0))
+
+(defun %delta-rtab (st relation facts)
+  "FACTS, distinct facts of RELATION that are all in the model, indexed like
+a relation: the model's own RTAB when they are the whole relation (a bulk
+load, a level of pure base facts), else a fresh small one. Used only while
+no write happens (E1)."
+  (let ((model (gethash relation (dstate-rels st))))
+    (if (and model (= (length facts) (hash-table-count (rtab-all model))))
+        model
+        (%rtab-of facts))))
+
+;;; P1. Compiled literals and rules.
+
+(defstruct (clit (:constructor %make-clit (kind index relation vars consts)))
+  "A literal compiled against its rule's variable numbering."
+  (kind :atom :type symbol)           ; :ATOM, :NOT (negated atom), :TEST (built-in), :NOT-TEST
+  (index -1 :type fixnum)             ; position in the body as written; -1 for a head
+  (relation nil)                      ; atoms: the relation; built-ins: the operator's SYMBOL-NAME
+  (vars #() :type simple-vector)      ; per argument: the variable number, or NIL for a constant
+  (consts #() :type simple-vector))   ; per argument: the constant where VARS holds NIL
+
+(defstruct (comp (:constructor %make-comp (nvars head body atoms positive)))
+  "A rule compiled once (P1), with its static seed plans."
+  (nvars 0 :type fixnum)              ; the length of an environment
+  (head nil)                          ; the head CLIT
+  (body #() :type simple-vector)      ; CLITs, written order
+  (atoms #() :type simple-vector)     ; per body index: for (not ATOM), ATOM as an :ATOM CLIT
+  (positive nil)                      ; does the body have a positive atom?
+  (seeds #() :type simple-vector)     ; per body index: a static seeded plan, or NIL (built-ins)
+  (rederive #() :type simple-vector)) ; static seeded plan: step 0 matches the head
+
+(defstruct (pstep (:constructor %make-pstep))
+  "One step of a plan (P2). Every argument action is fixed when the plan is
+made: there is no undo, and no slot is tested for NIL at run time."
+  (op :scan :type symbol)             ; :SEED :SCAN :PROBE :TEST :BIND
+  (clit nil)
+  (codes #() :type simple-vector)     ; :SEED / :SCAN, per argument: 0 check the constant,
+                                      ;   1 check the bound variable, 2 bind the variable
+  (keys #() :type simple-vector)      ; :SCAN: positions known on entry, variables first
+  (source :view)                      ; atoms: :VIEW, (:DELTA . RTAB), (:MINUS . RTAB), (:HEIGHT H . N)
+  (target 0 :type fixnum)             ; :BIND: the variable it sets
+  (from 0 :type fixnum)               ; :BIND: the argument (0 or 1) it takes the value of
+  (scratch nil))                      ; :SCAN: a cons for bucket keys; :PROBE and (not ATOM):
+                                      ;   a fact-shaped list; lookup keys only, never kept
+
+(declaim (inline %arg %match))
+
+(defun %arg (c i env)
+  "The value of argument I of C under ENV."
+  (let ((v (svref (clit-vars c) i)))
+    (if v (svref env v) (svref (clit-consts c) i))))
+
+(defun %match (fact codes vars consts env)
+  "Does FACT fit the argument CODES (and have their arity)? Binds the slots
+coded 2."
+  (declare (simple-vector codes vars consts env))
+  (let ((args (cdr fact)))
+    (dotimes (i (length codes) (null args))
+      (when (atom args) (return nil))
+      (let ((a (car args)))
+        (setf args (cdr args))
+        (case (svref codes i)
+          (0 (unless (equal a (svref consts i)) (return nil)))
+          (1 (unless (equal a (svref env (svref vars i))) (return nil)))
+          (t (setf (svref env (svref vars i)) a)))))))
+
+(defun %instantiate (c env)
+  "A fresh fact: the atom C with ENV's values."
+  (let ((vars (clit-vars c)) (consts (clit-consts c)))
+    (cons (clit-relation c)
+          (loop for i below (length vars)
+                collect (let ((v (svref vars i))) (if v (svref env v) (svref consts i)))))))
+
+(defun %fill (step env)
+  "STEP's scratch fact holding C's values under ENV: a lookup key only."
+  (let* ((c (pstep-clit step))
+         (vars (clit-vars c))
+         (consts (clit-consts c))
+         (fact (pstep-scratch step)))
+    (loop for cell on (cdr fact)
+          for i of-type fixnum from 0
+          do (setf (car cell) (let ((v (svref vars i))) (if v (svref env v) (svref consts i)))))
+    fact))
+
+(defun %env (nvars)
+  (make-array nvars :initial-element nil))
+
+(defun %numbering (variables)
+  "An EQ table: variable -> its position in VARIABLES."
+  (let ((table (make-hash-table :test 'eq :size +small-table-size+)))
+    (loop for v in variables
+          for i from 0
+          do (setf (gethash v table) i))
+    table))
+
+(defun %compile-literal (lit index numbering)
+  "LIT (a head atom, or the body literal at INDEX) as a CLIT. A variable
+NUMBERING lacks gets the next number."
+  (flet ((make (kind relation args)
+           (let* ((n (length args))
+                  (vars (make-array n :initial-element nil))
+                  (consts (make-array n :initial-element nil)))
+             (loop for a in args
+                   for i from 0
+                   do (if (logic-variable-p a)
+                          (setf (svref vars i)
+                                (or (gethash a numbering)
+                                    (setf (gethash a numbering) (hash-table-count numbering))))
+                          (setf (svref consts i) a)))
+             (%make-clit kind index relation vars consts))))
+    (cond ((%not-p lit)
+           (let ((inner (second lit)))
+             (if (builtin-literal-p inner)
+                 (make :not-test (symbol-name (car inner)) (cdr inner))
+                 (make :not (car inner) (cdr inner)))))
+          ((builtin-literal-p lit) (make :test (symbol-name (car lit)) (cdr lit)))
+          (t (make :atom (car lit) (cdr lit))))))
+
+(defun %compile-body (literals numbering)
+  (let ((i -1))
+    (map 'simple-vector (lambda (lit) (%compile-literal lit (incf i) numbering)) literals)))
+
+(defun %as-atom (c)
+  "The atom inside the negated-atom CLIT C, as an :ATOM CLIT at C's index."
+  (%make-clit :atom (clit-index c) (clit-relation c) (clit-vars c) (clit-consts c)))
 
 (defun %compile-crule (crule)
   "CRULE compiled once (P1): its variables numbered in the order of
@@ -906,23 +1074,381 @@ indexed by variable number and the proof bindings come out in order; each
 literal's arguments as constants or variable numbers; a static plan (%PLAN
 with no state) per body literal that can seed a derivation, for the rest of
 the body with that literal's variables bound, and one with the head's
-variables bound (re-derive)."
-  (declare (ignore crule))
-  (%perf-pending '%compile-crule))
+variables bound (re-derive). Reads the rule only (E2)."
+  (let* ((numbering (%numbering (atom-variables (rule-form (crule-rule crule)))))
+         (head (%compile-literal (crule-head crule) -1 numbering))
+         (body (%compile-body (crule-body crule) numbering))
+         (comp (%make-comp (hash-table-count numbering) head body
+                           (map 'simple-vector
+                                (lambda (c) (and (eq (clit-kind c) :not) (%as-atom c)))
+                                body)
+                           (and (find :atom body :key #'clit-kind) t)))
+         (nvars (comp-nvars comp))
+         (literals (coerce body 'list)))
+    (setf (comp-seeds comp)
+          (map 'simple-vector
+               (lambda (c)
+                 (case (clit-kind c)
+                   (:atom (%seeded-plan nvars c (remove c literals :test #'eq)))
+                   ;; (not ATOM): ATOM is matched, the negation stays in the
+                   ;; body and is checked in the view (as %SOLVE-FROM).
+                   (:not (%seeded-plan nvars (svref (comp-atoms comp) (clit-index c)) literals))
+                   (t nil)))
+               body)
+          (comp-rederive comp) (%seeded-plan nvars head literals))
+    comp))
 
 (defun %crule-compiled (crule)
   "CRULE's compiled form, made on first use and kept on the CRULE."
   (or (crule-compiled crule)
       (setf (crule-compiled crule) (%compile-crule crule))))
 
-(defun %plan (st literals known sources)
-  "A join plan (P2) for the compiled LITERALS with the variables KNOWN
-bound: their evaluation order, for each atom the facts it reads (SOURCES
-maps an atom to its view or delta) and the argument positions bound when it
-is reached. With ST, atoms are ordered by the sizes at that time; with ST
-NIL the plan is static (bound positions, then written order)."
-  (declare (ignore st literals known sources))
-  (%perf-pending '%plan))
+;;; P2. Plans.
+
+(declaim (inline %known-arg-p))
+(defun %known-arg-p (c i bound)
+  (let ((v (svref (clit-vars c) i)))
+    (or (null v) (= 1 (sbit bound v)))))
+
+(defun %all-known-p (c bound)
+  (dotimes (i (length (clit-vars c)) t)
+    (unless (%known-arg-p c i bound) (return nil))))
+
+(defun %ready-p (c bound)
+  "Can the plan take C now: a negation or built-in with every variable bound,
+or = with one side known?"
+  (ecase (clit-kind c)
+    (:atom nil)
+    (:test (let ((a (%known-arg-p c 0 bound))
+                 (b (%known-arg-p c 1 bound)))
+             (or (and a b) (and (or a b) (string= (clit-relation c) "=")))))
+    ((:not :not-test) (%all-known-p c bound))))
+
+(defun %atom-rank (c bound)
+  "(values GROUP KNOWN) of the atom C: GROUP 0 when every argument is known
+(a ground lookup), 1 when it shares a bound variable, else 2; KNOWN is the
+number of known positions."
+  (let ((vars (clit-vars c)) (known 0) (shares nil))
+    (dotimes (i (length vars))
+      (let ((v (svref vars i)))
+        (cond ((null v) (incf known))
+              ((= 1 (sbit bound v)) (incf known) (setf shares t)))))
+    (values (cond ((= known (length vars)) 0) (shares 1) (t 2)) known)))
+
+(defun %next-atom (literals bound sizes)
+  "The atom of LITERALS to read next: the least group (%ATOM-RANK), then the
+smallest source (SIZES, an alist, for a sized plan; the most known
+positions for a static one), then written order."
+  (let ((best nil) (best-group 0) (best-measure 0))
+    (dolist (c literals best)
+      (when (eq (clit-kind c) :atom)
+        (multiple-value-bind (group known) (%atom-rank c bound)
+          (let ((measure (if sizes (cdr (assoc c sizes :test #'eq)) (- known))))
+            (when (or (null best)
+                      (< group best-group)
+                      (and (= group best-group)
+                           (or (< measure best-measure)
+                               (and (= measure best-measure)
+                                    (< (clit-index c) (clit-index best))))))
+              (setf best c best-group group best-measure measure))))))))
+
+(defun %atom-step (c bound source &optional seed)
+  "The step that reads the atom C, marking its variables in BOUND: per
+argument check the constant, check the bound variable, or bind it (a
+repeated variable binds once, then checks). SEED: a :SEED step, matched
+against a given fact. Otherwise :PROBE when every argument is known, else
+:SCAN with the positions known on entry as bucket keys."
+  (let* ((vars (clit-vars c))
+         (n (length vars))
+         (codes (make-array n :initial-element 0))
+         (var-keys '())
+         (const-keys '())
+         (fresh '()))
+    (dotimes (i n)
+      (let ((v (svref vars i)))
+        (cond ((null v) (push i const-keys))
+              ((= 1 (sbit bound v))
+               (setf (svref codes i) 1)
+               (unless (member v fresh) (push i var-keys)))
+              (t (setf (svref codes i) 2
+                       (sbit bound v) 1)
+                 (push v fresh)))))
+    (cond (seed (%make-pstep :op :seed :clit c :codes codes))
+          ((null fresh)
+           (%make-pstep :op :probe :clit c :source source
+                        :scratch (cons (clit-relation c) (make-list n))))
+          (t (%make-pstep :op :scan :clit c :codes codes :source source
+                          :keys (coerce (append (nreverse var-keys) (nreverse const-keys))
+                                        'simple-vector)
+                          :scratch (cons 0 nil))))))
+
+(defun %filter-step (c bound)
+  "The step for C, ready per %READY-P: = with one side unknown binds it;
+anything else is a test."
+  (if (and (eq (clit-kind c) :test) (not (%all-known-p c bound)))
+      (let ((to (if (%known-arg-p c 0 bound) 1 0)))
+        (setf (sbit bound (svref (clit-vars c) to)) 1)
+        (%make-pstep :op :bind :clit c :target (svref (clit-vars c) to) :from (- 1 to)))
+      (%make-pstep :op :test :clit c
+                   :scratch (and (eq (clit-kind c) :not)
+                                 (cons (clit-relation c) (make-list (length (clit-vars c))))))))
+
+(defun %tab-size (tab c)
+  "An upper bound on the facts of TAB that can match the atom C: TAB's count,
+or the smallest bucket of C's constant arguments; 0 when TAB is NIL or has
+no fact with one of them."
+  (if (null tab)
+      0
+      (let ((n (hash-table-count (rtab-all tab)))
+            (vars (clit-vars c))
+            (consts (clit-consts c))
+            (index (rtab-index tab)))
+        (dotimes (i (length vars) n)
+          (unless (svref vars i)
+            (let ((b (gethash (cons i (svref consts i)) index)))
+              (if b
+                  (setf n (min n (hash-table-count b)))
+                  (return 0))))))))
+
+(defun %source-size (st c source view)
+  "An upper bound on what the atom C reads from SOURCE in VIEW; 0 only when
+it reads nothing, so a plan with a 0 can be dropped."
+  (let* ((model (gethash (clit-relation c) (dstate-rels st)))
+         (removed (and (eq view :old) (%old-removed-rtab (clit-relation c)))))
+    (flet ((view-size () (+ (%tab-size model c) (%tab-size removed c))))
+      (if (eq source :view)
+          (view-size)
+          (ecase (car source)
+            (:delta (%tab-size (cdr source) c))
+            ;; The delta is part of the view, so the count difference bounds
+            ;; the rest (exactly under :NEW). Never subtract from a bucket.
+            (:minus (max 0 (min (view-size)
+                                (- (+ (%tab-count model) (%tab-count removed))
+                                   (%tab-count (cdr source))))))
+            (:height (if (minusp (cadr source))
+                         0
+                         (min (cddr source) (%tab-size model c)))))))))
+
+(defun %plan (st nvars literals known sources &optional (view :new) bound)
+  "A join plan (P2) for the compiled LITERALS with the variables KNOWN (or
+the bit vector BOUND) bound: a SIMPLE-VECTOR of steps. SOURCES maps an atom
+CLIT to what it reads: :VIEW (the model, or :OLD in VIEW :OLD), (:DELTA .
+RTAB), (:MINUS . RTAB) (the view without the delta) or (:HEIGHT H . N)
+(model facts of height <= H, N of them). Negations and built-ins come as
+soon as their variables are bound, = as soon as one side is; then atoms by
+group (ground, sharing a bound variable, the rest), then size, then written
+order. With ST the sizes are those of now, and the result is NIL when some
+atom reads nothing; with ST NIL the plan is static (bound positions, then
+written order)."
+  (let ((bound (or bound
+                   (let ((b (make-array nvars :element-type 'bit :initial-element 0)))
+                     (dolist (v known b) (setf (sbit b v) 1)))))
+        (sizes '()))
+    (when st
+      (dolist (c literals)
+        (when (eq (clit-kind c) :atom)
+          (let ((n (%source-size st c (funcall sources c) view)))
+            (when (zerop n) (return-from %plan nil))
+            (push (cons c n) sizes)))))
+    (let ((left (copy-list literals))
+          (steps '()))
+      (loop while left
+            do (let ((c (find-if (lambda (c) (%ready-p c bound)) left)))
+                 (if c
+                     (push (%filter-step c bound) steps)
+                     (progn
+                       (setf c (%next-atom left bound sizes))
+                       (unless c
+                         (error "No literal of ~S can be evaluated (unsafe body)"
+                                (mapcar #'clit-relation left)))
+                       (push (%atom-step c bound (funcall sources c)) steps)))
+                 (setf left (delete c left :test #'eq :count 1))))
+      (coerce (nreverse steps) 'simple-vector))))
+
+(defun %seeded-plan (nvars seed literals)
+  "A static plan: step 0 matches a given fact against the atom SEED, then
+LITERALS with SEED's variables bound."
+  (let* ((bound (make-array nvars :element-type 'bit :initial-element 0))
+         (first (%atom-step seed bound :view t)))
+    (concatenate 'simple-vector
+                 (vector first)
+                 (%plan nil nvars literals '() (constantly :view) :new bound))))
+
+;;; The executor.
+
+(defun %bucket (tab step env)
+  "The smallest candidate table of TAB for STEP under ENV: its ALL table when
+no position is known, else the smallest bucket of the known positions, NIL
+when one is missing. Stops at a bucket of one fact (P1)."
+  (let ((keys (pstep-keys step)))
+    (if (zerop (length keys))
+        (rtab-all tab)
+        (let* ((c (pstep-clit step))
+               (vars (clit-vars c))
+               (consts (clit-consts c))
+               (key (pstep-scratch step))
+               (index (rtab-index tab))
+               (best nil)
+               (best-count 0))
+          (dotimes (j (length keys) best)
+            (let* ((p (svref keys j))
+                   (v (svref vars p)))
+              (setf (car key) p
+                    (cdr key) (if v (svref env v) (svref consts p)))
+              (let ((b (gethash key index)))
+                (cond ((null b) (return nil))
+                      ((or (null best) (< (hash-table-count b) best-count))
+                       (setf best b
+                             best-count (hash-table-count b))
+                       (when (<= best-count 1) (return best)))))))))))
+
+(defun %test-holds-p (st step env view)
+  "Does the filter STEP hold under ENV? A negated atom reads :OLD in VIEW
+:OLD and the model otherwise (as %FILTER-HOLDS-P)."
+  (let ((c (pstep-clit step)))
+    (ecase (clit-kind c)
+      (:test (%builtin-holds (clit-relation c) (%arg c 0 env) (%arg c 1 env)))
+      (:not-test (not (%builtin-holds (clit-relation c) (%arg c 0 env) (%arg c 1 env))))
+      (:not (not (%visible-p st (%fill step env) (if (eq view :old) :old :new)))))))
+
+(defun %run-plan (st plan start env view fn)
+  "Run PLAN's steps from START on ENV in VIEW (:NEW or :OLD), calling FN with
+ENV for every solution. ENV is overwritten afterwards: FN copies what it
+keeps, and writes no table a step may be reading (E1)."
+  (declare (simple-vector plan env) (fixnum start) (function fn))
+  (let ((n (length plan))
+        (rels (dstate-rels st)))
+    (labels ((run (k)
+               (declare (fixnum k))
+               (if (= k n)
+                   (funcall fn env)
+                   (let ((step (svref plan k)))
+                     (ecase (pstep-op step)
+                       (:scan (scan step (1+ k)))
+                       (:probe (when (probe step) (run (1+ k))))
+                       (:test (when (%test-holds-p st step env view) (run (1+ k))))
+                       (:bind (setf (svref env (pstep-target step))
+                                    (%arg (pstep-clit step) (pstep-from step) env))
+                              (run (1+ k)))))))
+             (walk (tab step next added exclude height)
+               ;; The facts of TAB's best bucket that match STEP, skipping
+               ;; those ADDED (a *CHANGE* table) or in EXCLUDE, and keeping
+               ;; only those of height <= HEIGHT when it is given.
+               (when tab
+                 (let ((bucket (%bucket tab step env)))
+                   (when bucket
+                     (let* ((c (pstep-clit step))
+                            (codes (pstep-codes step))
+                            (vars (clit-vars c))
+                            (consts (clit-consts c)))
+                       (loop for f being the hash-keys of bucket
+                             do (when (and (or (null added) (not (eq (gethash f added) :added)))
+                                           (or (null exclude) (not (gethash f exclude)))
+                                           (or (null height)
+                                               (let ((h (gethash f *heights*)))
+                                                 (and h (<= h height))))
+                                           (%match f codes vars consts env))
+                                  (run next))))))))
+             (walk-view (step next exclude)
+               ;; :NEW is the model. :OLD is the model without the net
+               ;; additions plus the net removals, read through their own
+               ;; index (P4).
+               (let ((rel (clit-relation (pstep-clit step))))
+                 (if (eq view :old)
+                     (let ((changes (and *change* (gethash rel *change*))))
+                       (walk (gethash rel rels) step next changes exclude nil)
+                       (when changes
+                         (walk (%old-removed-rtab rel) step next nil exclude nil)))
+                     (walk (gethash rel rels) step next nil exclude nil))))
+             (scan (step next)
+               (let ((source (pstep-source step)))
+                 (if (eq source :view)
+                     (walk-view step next nil)
+                     (ecase (car source)
+                       (:delta (walk (cdr source) step next nil nil nil))
+                       (:minus (walk-view step next (rtab-all (cdr source))))
+                       (:height (walk (gethash (clit-relation (pstep-clit step)) rels)
+                                      step next nil nil (cadr source)))))))
+             (probe (step)
+               (let ((fact (%fill step env))
+                     (source (pstep-source step)))
+                 (if (eq source :view)
+                     (%visible-p st fact view)
+                     (ecase (car source)
+                       (:delta (gethash fact (rtab-all (cdr source))))
+                       (:minus (and (%visible-p st fact view)
+                                    (not (gethash fact (rtab-all (cdr source))))))
+                       (:height (let ((h (gethash fact *heights*)))
+                                  (and h (<= h (cadr source))))))))))
+      (run start))))
+
+(defun %run-seeded (st plan nvars fact view fn)
+  "Run the static seeded PLAN with its step 0 matched against FACT."
+  (let* ((seed (svref plan 0))
+         (c (pstep-clit seed))
+         (env (%env nvars)))
+    (when (and (eq (clit-relation c) (car fact))
+               (%match fact (pstep-codes seed) (clit-vars c) (clit-consts c) env))
+      (%run-plan st plan 1 env view fn))))
+
+(defun %solve-all (st comp view fn)
+  "FN on every solution of COMP's whole body in VIEW, planned with the sizes
+of now."
+  (let ((plan (%plan st (comp-nvars comp) (coerce (comp-body comp) 'list) '()
+                     (constantly :view) view)))
+    (when plan
+      (%run-plan st plan 0 (%env (comp-nvars comp)) view fn))))
+
+(defun %join-deltas (st cr posd negd view fn)
+  "FN on the solutions of CR's body (in VIEW) that read a delta (P3 rounds).
+POSD and NEGD map a relation to a delta RTAB (or are NIL). For each positive
+literal I whose relation has a POSD delta, a plan sized now where I reads
+the delta; for each (not ATOM) at I whose relation has a NEGD delta, one
+where ATOM reads it and the negation stays. In either, every earlier
+positive literal (written order) whose relation has a POSD delta reads the
+view without it, and the rest read the view. So a derivation is found at
+the first literal, in written order, that reads a delta: once per round for
+the positive deltas."
+  (let* ((comp (%crule-compiled cr))
+         (body (comp-body comp))
+         (nvars (comp-nvars comp))
+         (literals (coerce body 'list)))
+    (dotimes (i (length body))
+      (let* ((c (svref body i))
+             (d (case (clit-kind c)
+                  (:atom (and posd (gethash (clit-relation c) posd)))
+                  (:not (and negd (gethash (clit-relation c) negd))))))
+        (when d
+          (let* ((seed (if (eq (clit-kind c) :atom) c (svref (comp-atoms comp) i)))
+                 (plan (%plan st nvars (if (eq seed c) literals (cons seed literals)) '()
+                              (lambda (x)
+                                (let ((dx (and posd (gethash (clit-relation x) posd))))
+                                  (cond ((eq x seed) (cons :delta d))
+                                        ((and dx (< (clit-index x) i)) (cons :minus dx))
+                                        (t :view))))
+                              view)))
+            (when plan
+              (%run-plan st plan 0 (%env nvars) view fn))))))))
+
+(defun %read-in-stratum-p (st relation s)
+  "Does a rule of stratum S read RELATION through a positive atom?"
+  (loop for entry in (gethash relation (dstate-readers st))
+          thereis (= (third entry) s)))
+
+(defun %round-deltas (st s facts)
+  "FACTS (distinct, all in the model) as delta RTABs by relation (an EQ
+table), for the relations a rule of stratum S reads positively."
+  (let ((groups (make-hash-table :test 'eq :size +small-table-size+))
+        (deltas (make-hash-table :test 'eq :size +small-table-size+)))
+    (dolist (f facts)
+      (push f (gethash (car f) groups)))
+    (maphash (lambda (relation group)
+               (when (%read-in-stratum-p st relation s)
+                 (setf (gethash relation deltas) (%delta-rtab st relation group))))
+             groups)
+    deltas))
+
+;;; P3. Phase inputs and modes.
 
 (defun %set-at-a-time-p (st deltas)
   "Is a maintenance phase whose input delta is DELTAS, a list of
@@ -930,39 +1456,446 @@ NIL the plan is static (bound positions, then written order)."
 least *SET-AT-A-TIME-MINIMUM* elements, or at least *SET-AT-A-TIME-RATIO*
 times the relation's size (its facts in the model of ST now, plus those of
 FACTS not in it). A NIL threshold does not apply."
-  (declare (ignore st deltas))
-  (%perf-pending '%set-at-a-time-p))
+  (let ((ratio *set-at-a-time-ratio*)
+        (minimum *set-at-a-time-minimum*))
+    (loop for (relation . facts) in deltas
+          for n = (length facts)
+            thereis (and (plusp n)
+                         (or (and minimum (>= n minimum))
+                             (and ratio
+                                  (>= n (* ratio
+                                           (+ (%tab-count (gethash relation (dstate-rels st)))
+                                              (count-if-not (lambda (f) (in-model-p st f))
+                                                            facts))))))))))
+
+(defun %phase-mode (st s phase &rest parts)
+  "The mode of PHASE (:OVER-DELETE or :INSERT) of stratum S from its input
+delta D, given as PARTS: lists of (RELATION . FACTS), the facts distinct and
+the parts disjoint. NIL when D is empty (nothing to do, nothing reported);
+otherwise :SET-AT-A-TIME or :PER-FACT (%SET-AT-A-TIME-P), after calling
+*MODE-HOOK* with (S PHASE MODE)."
+  (let ((d (make-hash-table :test 'eq :size +small-table-size+)))
+    (dolist (part parts)
+      (dolist (entry part)
+        (when (cdr entry)
+          (setf (gethash (car entry) d) (append (cdr entry) (gethash (car entry) d))))))
+    (when (plusp (hash-table-count d))
+      (let ((mode (if (%set-at-a-time-p st (loop for relation being the hash-keys of d
+                                                   using (hash-value facts)
+                                                 collect (cons relation facts)))
+                      :set-at-a-time
+                      :per-fact)))
+        (when *mode-hook*
+          (funcall *mode-hook* s phase mode))
+        mode))))
+
+(defun %lower-reads (st s rules)
+  "(values POSITIVE NEGATED): EQ sets of the lower relations RULES (of
+stratum S) read through positive atoms, and of the relations they read
+under NOT."
+  (let ((positive (make-hash-table :test 'eq :size +small-table-size+))
+        (negated (make-hash-table :test 'eq :size +small-table-size+)))
+    (dolist (cr rules)
+      (loop for c across (comp-body (%crule-compiled cr))
+            do (case (clit-kind c)
+                 (:atom (when (< (%stratum st (clit-relation c)) s)
+                          (setf (gethash (clit-relation c) positive) t)))
+                 (:not (setf (gethash (clit-relation c) negated) t)))))
+    (values positive negated)))
+
+(defun %lower-changes (relations status)
+  "((RELATION . FACTS) ...): the facts of each of RELATIONS (an EQ set) with
+net STATUS in this call, for those that have some."
+  (loop for relation being the hash-keys of relations
+        for facts = (%changed relation status)
+        when facts collect (cons relation facts)))
+
+(defun %by-relation (facts)
+  "FACTS without duplicates, as ((RELATION . FACTS) ...)."
+  (let ((seen (make-hash-table :test 'equal :size +small-table-size+))
+        (groups (make-hash-table :test 'eq :size +small-table-size+)))
+    (dolist (f facts)
+      (unless (gethash f seen)
+        (setf (gethash f seen) t)
+        (push f (gethash (car f) groups))))
+    (loop for relation being the hash-keys of groups using (hash-value group)
+          collect (cons relation group))))
+
+;;; Maintenance under :AUTO.
+
+(defun %derivable-auto-p (st rules fact)
+  "Does one of RULES derive FACT in one step from the current model?
+(%DERIVABLE-P on compiled rules: the head matched, then the static
+re-derive plan.)"
+  (dolist (cr rules nil)
+    (when (eq (car (crule-head cr)) (car fact))
+      (let ((comp (%crule-compiled cr)))
+        (%run-seeded st (comp-rederive comp) (comp-nvars comp) fact :new
+                     (lambda (env)
+                       (declare (ignore env))
+                       (return-from %derivable-auto-p t)))))))
+
+(defun %first-derivations (st new meter)
+  "The distinct heads, not in the model, of the solutions of the NEW rules'
+bodies in the model as it is now, one charge per solution. The model is not
+written (E1)."
+  (let ((seen (make-hash-table :test 'equal :size +small-table-size+))
+        (heads '()))
+    (dolist (cr new (nreverse heads))
+      (let* ((comp (%crule-compiled cr))
+             (head (comp-head comp)))
+        (%solve-all st comp :new
+                    (lambda (env)
+                      (charge-budget meter)
+                      (let ((h (%instantiate head env)))
+                        (unless (or (gethash h seen) (in-model-p st h))
+                          (setf (gethash h seen) t)
+                          (push h heads)))))))))
+
+(defun %over-delete-auto (st s old new retracted pos neg od mode meter)
+  "Phase 1 of %MAINTAIN-STRATUM-AUTO in MODE: OD (fact -> T) gets every fact
+with a derivation by an OLD rule of stratum S in :OLD through a fact already
+in OD, a RETRACTED fact, a POS fact (lower net removals, (RELATION . FACTS))
+at a positive literal or a NEG fact (lower net additions) at a negated one.
+A fact enters OD when it is in the model and not a base fact, with one
+charge, plus one per derivation, as in %MAINTAIN-STRATUM. OD is that
+closure in either mode."
+  (let ((work '()))
+    (labels ((od-add (f)
+               (when (and (in-model-p st f) (not (base-p st f)) (not (gethash f od)))
+                 (charge-budget meter)
+                 (setf (gethash f od) t)
+                 (push f work)))
+             (derive (cr)
+               (let ((head (comp-head (%crule-compiled cr))))
+                 (lambda (env)
+                   (charge-budget meter)
+                   (od-add (%instantiate head env))))))
+      (dolist (f retracted)
+        (od-add f))
+      (ecase mode
+        (:per-fact
+         ;; The 0.1.0 worklist on compiled rules: one seed per fact and literal.
+         (dolist (cr old)
+           (let ((comp (%crule-compiled cr))
+                 (fn (derive cr)))
+             (loop for c across (comp-body comp)
+                   for i from 0
+                   do (dolist (g (case (clit-kind c)
+                                   (:atom (cdr (assoc (clit-relation c) pos)))
+                                   (:not (cdr (assoc (clit-relation c) neg)))))
+                        (%run-seeded st (svref (comp-seeds comp) i) (comp-nvars comp) g :old fn)))))
+         (loop while work
+               do (let ((f (pop work)))
+                    (dolist (entry (gethash (car f) (dstate-readers st)))
+                      (let ((cr (first entry)))
+                        (when (and (= (third entry) s) (not (member cr new)))
+                          (let ((comp (%crule-compiled cr)))
+                            (%run-seeded st (svref (comp-seeds comp) (second entry))
+                                         (comp-nvars comp) f :old (derive cr)))))))))
+        (:set-at-a-time
+         ;; Round 0 joins the lower changes; round K+1 the facts round K
+         ;; added to OD (the retracted ones count for round 0). Nothing is
+         ;; removed until OD is complete, so S's relations show the old
+         ;; model throughout.
+         (let ((posd (make-hash-table :test 'eq :size +small-table-size+))
+               (negd (make-hash-table :test 'eq :size +small-table-size+)))
+           (dolist (entry pos)
+             (setf (gethash (car entry) posd) (%old-removed-rtab (car entry))))
+           (dolist (entry neg)
+             (setf (gethash (car entry) negd) (%delta-rtab st (car entry) (cdr entry))))
+           (dolist (cr old)
+             (%join-deltas st cr posd negd :old (derive cr))))
+         (loop while work
+               do (let ((deltas (%round-deltas st s work)))
+                    (setf work '())
+                    (when (plusp (hash-table-count deltas))
+                      (dolist (cr old)
+                        (%join-deltas st cr deltas nil :old (derive cr)))))))))))
+
+(defun %insert-auto (st s old rules own first pos neg mode meter)
+  "Phase 3 of %MAINTAIN-STRATUM-AUTO in MODE, from OWN (the facts of stratum
+S that entered the model: asserted and re-derived), FIRST (the new rules'
+first derivations, not in the model yet), POS (lower net additions read
+positively) and NEG (lower net removals read under NOT), as
+((RELATION . FACTS) ...). The OLD rules join OWN, POS and NEG; every rule
+of S (RULES) joins what the phase adds. One charge per derivation."
+  (ecase mode
+    (:per-fact
+     ;; The 0.1.0 worklist on compiled rules. A seed's heads enter the model
+     ;; after its plan returns (E1).
+     (let ((work (copy-list own)))
+       (flet ((enter (heads)
+                (dolist (h heads)
+                  (when (model-add st h)
+                    (%note h :added)
+                    (push h work))))
+              (seed (comp i fact)
+                (let ((head (comp-head comp))
+                      (heads '()))
+                  (%run-seeded st (svref (comp-seeds comp) i) (comp-nvars comp) fact :new
+                               (lambda (env)
+                                 (charge-budget meter)
+                                 (push (%instantiate head env) heads)))
+                  heads)))
+         (enter first)
+         (dolist (cr old)
+           (let ((comp (%crule-compiled cr)))
+             (loop for c across (comp-body comp)
+                   for i from 0
+                   do (dolist (g (case (clit-kind c)
+                                   (:atom (cdr (assoc (clit-relation c) pos)))
+                                   (:not (cdr (assoc (clit-relation c) neg)))))
+                        (enter (seed comp i g))))))
+         (loop while work
+               do (let ((f (pop work)))
+                    (dolist (entry (gethash (car f) (dstate-readers st)))
+                      (when (= (third entry) s)
+                        (enter (seed (%crule-compiled (first entry)) (second entry) f)))))))))
+    (:set-at-a-time
+     ;; Round 0: the old rules join OWN, POS and NEG; FIRST is already
+     ;; pending. Round R+1 joins, with every rule, what round R produced,
+     ;; which enters the model when round R ends.
+     (let ((pending (make-hash-table :test 'equal :size +small-table-size+))
+           (heads '()))
+       (flet ((collect (cr)
+                (let ((head (comp-head (%crule-compiled cr))))
+                  (lambda (env)
+                    (charge-budget meter)
+                    (let ((h (%instantiate head env)))
+                      (unless (or (gethash h pending) (in-model-p st h))
+                        (setf (gethash h pending) t)
+                        (push h heads)))))))
+         (dolist (h first)
+           (setf (gethash h pending) t)
+           (push h heads))
+         (let ((posd (%round-deltas st s own))
+               (negd (make-hash-table :test 'eq :size +small-table-size+)))
+           (dolist (entry pos)
+             (setf (gethash (car entry) posd) (%delta-rtab st (car entry) (cdr entry))))
+           (dolist (entry neg)
+             (setf (gethash (car entry) negd) (%old-removed-rtab (car entry))))
+           (dolist (cr old)
+             (%join-deltas st cr posd negd :new (collect cr))))
+         (loop while heads
+               do (let ((entered heads))
+                    (setf heads '()
+                          pending (make-hash-table :test 'equal :size +small-table-size+))
+                    (dolist (h entered)
+                      (when (model-add st h)
+                        (%note h :added)))
+                    (let ((deltas (%round-deltas st s entered)))
+                      (when (plusp (hash-table-count deltas))
+                        (dolist (cr rules)
+                          (%join-deltas st cr deltas nil :new (collect cr))))))))))))
 
 (defun %maintain-stratum-auto (st s retracted asserted new meter)
   "%MAINTAIN-STRATUM under :AUTO, with the same arguments, phases, charges
 and result (the model and *CHANGE* updated through the logged mutators and
 %NOTE): over-delete, re-derive, insert. Over-delete and insert each choose
-PER-FACT or SET-AT-A-TIME from their input delta (%SET-AT-A-TIME-P), tell
-*MODE-HOOK* (S PHASE MODE) when that delta is not empty, and run on compiled
-rules (P1, P2) with an indexed :OLD view (P4); re-derive is per fact."
-  (declare (ignore st s retracted asserted new meter))
-  (%perf-pending '%maintain-stratum-auto))
+PER-FACT or SET-AT-A-TIME from their input delta D (%SET-AT-A-TIME-P), tell
+*MODE-HOOK* (S PHASE MODE) when D is not empty, and run on compiled rules
+(P1, P2) with an indexed :OLD view (P4); re-derive is per fact.
+
+D, per relation (the same in every regime, so the phases reported never
+depend on the mode):
+- over-delete: RETRACTED; the net removals of the lower relations the old
+  rules of S read positively; the net additions of those they read under
+  NOT (the joins the phase starts from; the new rules take no part);
+- insert: ASSERTED as passed (one already in the model counts but is not
+  joined), the re-derived facts, the new rules' first derivations (their
+  distinct heads not in the model, from a full solve over the model after
+  re-derive); the net additions of the lower relations the old rules read
+  positively; the net removals of those they read under NOT."
+  (let* ((rules (aref (dstate-strata st) s))
+         (old (remove-if (lambda (cr) (member cr new)) rules))
+         (*old-removed* (make-hash-table :test 'eq :size +small-table-size+))
+         (od (make-hash-table :test 'equal :size +small-table-size+)))
+    (multiple-value-bind (pos-reads neg-reads) (%lower-reads st s old)
+      ;; 1. Over-delete (view :OLD).
+      (let* ((pos (%lower-changes pos-reads :removed))
+             (neg (%lower-changes neg-reads :added))
+             (mode (%phase-mode st s :over-delete (%by-relation retracted) pos neg)))
+        (when mode
+          (%over-delete-auto st s old new retracted pos neg od mode meter)))
+      ;; 2. Remove the over-deleted facts, then re-derive them per fact
+      ;; (view :NEW).
+      (let ((deleted (loop for f being the hash-keys of od collect f))
+            (redone '())
+            (entered '()))
+        (dolist (f deleted)
+          (model-remove st f)
+          (%note f :removed))
+        (dolist (f deleted)
+          (when (%derivable-auto-p st rules f)
+            (charge-budget meter)
+            (model-add st f)
+            (%note f :added)
+            (push f redone)))
+        ;; 3. Insert (view :NEW).
+        (dolist (f asserted)
+          (unless (in-model-p st f)
+            (charge-budget meter)
+            (model-add st f)
+            (%note f :added)
+            (push f entered)))
+        (let* ((first (%first-derivations st new meter))
+               (pos (%lower-changes pos-reads :added))
+               (neg (%lower-changes neg-reads :removed))
+               (mode (%phase-mode st s :insert (%by-relation (append asserted redone first))
+                                  pos neg)))
+          (when mode
+            (%insert-auto st s old rules (append entered redone) first pos neg mode meter)))))))
+
+;;; Query and time steps under :AUTO.
 
 (defun %query-auto (st pattern meter)
   "BACKEND-QUERY under :AUTO: PATTERN compiled and planned once against the
 current sizes, the same answers, charges and partial function."
-  (declare (ignore st pattern meter))
-  (%perf-pending '%query-auto))
+  (let* ((variables (atom-variables pattern))
+         (numbering (%numbering variables))
+         (body (%compile-body pattern numbering))
+         (nvars (hash-table-count numbering))
+         (answers '()))
+    (setf (budget-meter-partial-function meter) (lambda () answers))
+    (let ((plan (%plan st nvars (coerce body 'list) '() (constantly :view) :new)))
+      (when plan
+        (%run-plan st plan 0 (%env nvars) :new
+                   (lambda (env)
+                     (push (loop for v in variables
+                                 for i from 0
+                                 collect (cons v (svref env i)))
+                           answers)
+                     (charge-budget meter)))))
+    answers))
 
 (defun %next-base-auto (st meter)
   "BACKEND-TICK's next base facts under :AUTO: an EQUAL hash table holding
 the head of every solution of every :NEXT rule's body in the current model,
 one charge per solution."
-  (declare (ignore st meter))
-  (%perf-pending '%next-base-auto))
+  (let ((next (make-hash-table :test 'equal :size +small-table-size+)))
+    (dolist (cr (dstate-next st) next)
+      (let* ((comp (%crule-compiled cr))
+             (head (comp-head comp)))
+        (%solve-all st comp :new
+                    (lambda (env)
+                      (charge-budget meter)
+                      (setf (gethash (%instantiate head env) next) t)))))))
+
+;;; P5. EXPLAIN heights over the positive cone.
+
+(defun %positive-cone (st relation covered)
+  "An EQ set: RELATION and the relations of COVERED (an EQ set already closed,
+or NIL), closed under the relations the :NORMAL rules of its relations read
+through positive atoms. Negations are not followed: they read the model."
+  (let ((cone (make-hash-table :test 'eq :size +small-table-size+))
+        (by-head (make-hash-table :test 'eq :size +small-table-size+))
+        (work (list relation)))
+    (dolist (cr (dstate-normal st))
+      (push cr (gethash (car (crule-head cr)) by-head)))
+    (when covered
+      (maphash (lambda (r v) (declare (ignore v)) (setf (gethash r cone) t)) covered))
+    (loop while work
+          do (let ((r (pop work)))
+               (unless (gethash r cone)
+                 (setf (gethash r cone) t)
+                 (dolist (cr (gethash r by-head))
+                   (loop for c across (comp-body (%crule-compiled cr))
+                         when (eq (clit-kind c) :atom)
+                           do (push (clit-relation c) work))))))
+    cone))
+
+(defun %join-level (st comp k level below upto fn)
+  "FN on the solutions of COMP's body at level K (P5): for each positive
+literal I whose relation has facts of height K-1 (LEVEL: relation -> RTAB),
+I reads those, the earlier positive literals the facts of height <= K-2
+(BELOW: relation -> how many) and the later ones those of height <= K-1
+(UPTO). Negations read the model."
+  (let ((body (comp-body comp))
+        (nvars (comp-nvars comp)))
+    (dotimes (i (length body))
+      (let* ((c (svref body i))
+             (d (and (eq (clit-kind c) :atom) (gethash (clit-relation c) level))))
+        (when d
+          (let ((plan (%plan st nvars (coerce body 'list) '()
+                             (lambda (x)
+                               (let ((relation (clit-relation x)))
+                                 (cond ((eq x c) (cons :delta d))
+                                       ((< (clit-index x) i)
+                                        (list* :height (- k 2) (gethash relation below 0)))
+                                       (t (list* :height (- k 1) (gethash relation upto 0))))))
+                             :new)))
+            (when plan
+              (%run-plan st plan 0 (%env nvars) :new fn))))))))
+
+(defun %cone-heights (st cone)
+  "The least heights of %COMPUTE-HEIGHTS for the facts of the relations of
+CONE (closed under positive reads), level by level (P5): level 0 is their
+base facts; level K finds, by %JOIN-LEVEL, the derivations whose highest
+positive premise has height K-1; a rule with no positive atom derives at
+level 1 only. Stops at a level that adds nothing."
+  (let ((heights (make-hash-table :test 'equal))
+        (rules (remove-if-not (lambda (cr) (gethash (car (crule-head cr)) cone))
+                              (dstate-normal st)))
+        (below (make-hash-table :test 'eq :size +small-table-size+))
+        (upto (make-hash-table :test 'eq :size +small-table-size+))
+        (level (make-hash-table :test 'eq :size +small-table-size+)))
+    (loop for relation being the hash-keys of cone
+          do (let ((tab (gethash relation (dstate-rels st)))
+                   (base '()))
+               (when tab
+                 (loop for f being the hash-keys of (rtab-all tab)
+                       when (base-p st f)
+                         do (setf (gethash f heights) 0)
+                            (push f base))
+                 (when base
+                   (setf (gethash relation upto) (length base)
+                         (gethash relation level) (%delta-rtab st relation base))))))
+    (let ((*heights* heights))
+      (loop for k from 1
+            do (let ((fresh '()))
+                 (dolist (cr rules)
+                   (let* ((comp (%crule-compiled cr))
+                          (head (comp-head comp))
+                          ;; A height assigned during level K is K, which no
+                          ;; source of this level shows (<= K-1).
+                          (fn (lambda (env)
+                                (let ((h (%instantiate head env)))
+                                  (unless (gethash h heights)
+                                    (setf (gethash h heights) k)
+                                    (push h fresh))))))
+                     (if (comp-positive comp)
+                         (%join-level st comp k level below upto fn)
+                         (when (= k 1)
+                           (%solve-all st comp :new fn)))))
+                 (when (null fresh)
+                   (return))
+                 (let ((next-below (make-hash-table :test 'eq :size +small-table-size+))
+                       (groups (make-hash-table :test 'eq :size +small-table-size+)))
+                   (maphash (lambda (relation n) (setf (gethash relation next-below) n)) upto)
+                   (dolist (f fresh)
+                     (push f (gethash (car f) groups))
+                     (incf (gethash (car f) upto 0)))
+                   (setf below next-below
+                         level (make-hash-table :test 'eq :size +small-table-size+))
+                   (maphash (lambda (relation facts)
+                              (setf (gethash relation level) (%delta-rtab st relation facts)))
+                            groups)))))
+    heights))
 
 (defun %heights-auto (st fact)
   "The least-height table %PROVE reads for FACT under :AUTO (P5): the same
 heights as %COMPUTE-HEIGHTS for every relation in the positive cone of
 FACT's relation, computed semi-naively level by level and cached in the
-state until the next write."
-  (declare (ignore st fact))
-  (%perf-pending '%heights-auto))
+state, with the relations it covers, until the next write (%LOG,
+WITH-TRANSACTION). A base fact needs none: %PROVE gives it its base proof."
+  (let ((cache (dstate-cone st)))
+    (cond ((base-p st fact)
+           (if cache (cdr cache) (make-hash-table :test 'equal :size 1)))
+          ((and cache (gethash (car fact) (car cache)))
+           (cdr cache))
+          (t (let ((cone (%positive-cone st (car fact) (and cache (car cache)))))
+               (cdr (setf (dstate-cone st) (cons cone (%cone-heights st cone)))))))))
 
 (unless *logic-backend*
   (setf *logic-backend* (make-datalog-backend)))
